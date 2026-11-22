@@ -1,0 +1,89 @@
+name: Capture official open-data snapshots
+
+# Capture official TWSE and TPEx open-data JSON on fixed schedules.
+# Preserve source bytes and acquisition evidence; do not overwrite prior captures.
+on:
+  schedule:
+    - cron: "32 12 * * *"  # 台北 20:32（上櫃首抓，避開 18:00／20:00 公布與整點尖峰）
+    - cron: "42 15 * * *"  # 台北 23:42（上櫃 23:30 刷新補抓）
+    - cron: "32 21 * * *"  # 台北 05:32（上市首抓，在 TWT48U_ALL 05:29 更新後）
+    - cron: "02 22 * * *"  # 台北 06:02（上市第 2 窗）
+    - cron: "32 22 * * *"  # 台北 06:32（上市第 3 窗）
+    - cron: "02 23 * * *"  # 台北 07:02（上市第 4 窗，07:30 觀察線前最後一班）
+    - cron: "23 04 * * *"  # 台北 12:23（僅供封存補抓，防 6 班全漏斷檔；逾時照記盤前失敗）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: capture
+  cancel-in-progress: false
+
+jobs:
+  capture:
+    name: Capture and archive
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Capture into an empty directory
+        id: capture
+        run: |
+          set +e
+          python3 -I scripts/capture.py "$RUNNER_TEMP/out"
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Add new files, never overwrite
+        run: |
+          : > "$RUNNER_TEMP/added.txt"
+          [ -d "$RUNNER_TEMP/out" ] || { echo "nothing captured"; exit 0; }
+          cd "$RUNNER_TEMP/out"
+          find . -type f -name '*.json' ! -name '*.meta.json' | sort > "$RUNNER_TEMP/raw.txt"
+          while read -r raw; do
+            raw="${raw#./}"; meta="${raw%.json}.meta.json"
+            [ -f "$meta" ] || { echo "::error::captured file has no sidecar: $raw"; exit 1; }
+            dest="$GITHUB_WORKSPACE/$raw"; dest_meta="$GITHUB_WORKSPACE/$meta"
+            if [ -e "$dest" ]; then
+              cmp -s "$raw" "$dest" || { echo "::error::same path, different bytes: $raw"; exit 1; }
+              [ -f "$dest_meta" ] || { echo "::error::archived file has no sidecar: $raw"; exit 1; }
+              echo "already archived (keeping the original capture time): $raw"
+            else
+              [ ! -e "$dest_meta" ] || { echo "::error::sidecar exists without its file: $meta"; exit 1; }
+              mkdir -p "$(dirname "$dest")"
+              cp "$raw" "$dest"
+              cp "$meta" "$dest_meta"
+              printf '%s\n%s\n' "$raw" "$meta" >> "$RUNNER_TEMP/added.txt"
+              echo "new: $raw"
+            fi
+          done < "$RUNNER_TEMP/raw.txt"
+
+      - name: Verify every archived file against its name and its sidecar
+        run: |
+          status=0
+          while read -r raw; do
+            want="$(basename "$raw" .json)"; got="$(sha256sum "$raw" | cut -d' ' -f1)"
+            [ "$want" = "$got" ] || { echo "::error::hash mismatch: $raw"; status=1; }
+            [ -f "${raw%.json}.meta.json" ] || { echo "::error::no sidecar: $raw"; status=1; }
+          done < <(find snapshots observations -type f -name '*.json' ! -name '*.meta.json' 2>/dev/null | sort)
+          while read -r meta; do
+            [ -f "${meta%.meta.json}.json" ] || { echo "::error::sidecar without its file: $meta"; status=1; }
+          done < <(find snapshots observations -type f -name '*.meta.json' 2>/dev/null | sort)
+          exit $status
+
+      - name: Commit and push only the files added in this run
+        run: |
+          if [ ! -s "$RUNNER_TEMP/added.txt" ]; then echo "no new files"; exit 0; fi
+          git add --pathspec-from-file="$RUNNER_TEMP/added.txt"
+          git diff --cached --name-only | sort > "$RUNNER_TEMP/staged.txt"
+          sort "$RUNNER_TEMP/added.txt" | cmp -s - "$RUNNER_TEMP/staged.txt" || { echo "::error::staged files differ from the files added in this run"; exit 1; }
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -m "data: capture $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push
+
+      - name: Fail when any endpoint failed
+        if: steps.capture.outputs.exit != '0'
+        run: |
+          echo "::error::one or more endpoints failed; see the capture step log"
+          exit 1
